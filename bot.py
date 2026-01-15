@@ -22,7 +22,7 @@ def run_web_server():
 # ================= CONFIG =================
 
 # Use Environment Variable for security on Render
-BOT_TOKEN = os.getenv("8023097141:AAHQhpp6NTYA_buZhfh5mn-DZftbdPccKeM")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_KEY = "9935ca70e0f842569acc2790803c1e0c" 
 
 PAIRS = {
