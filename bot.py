@@ -1,173 +1,205 @@
 import os
 import requests
 import datetime
-import time
-import threading
+import asyncio
 from flask import Flask
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# ================= KEEP-ALIVE SYSTEM =================
-app_web = Flask('')
+# ================= KEEP ALIVE =================
+web = Flask("")
 
-@app_web.route('/')
+@web.route("/")
 def home():
-    return "Lazy Bot is Online and Trading!"
+    return "Lazy ORB + ICT Bot Online"
 
-def run_web_server():
-    # This grabs the port Render assigns (usually 10000)
-    port = int(os.environ.get('PORT', 10000))
-    app_web.run(host='0.0.0.0', port=port)
-    
+def run_web():
+    port = int(os.environ.get("PORT", 10000))
+    web.run(host="0.0.0.0", port=port)
 
 # ================= CONFIG =================
-
-# Use Environment Variable for security on Render
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-API_KEY = "9935ca70e0f842569acc2790803c1e0c" 
+API_KEY = "9935ca70e0f842569acc2790803c1e0c"
 
-PAIRS = {
-    "EURGBP": "EUR/GBP", "AUDGBP": "AUD/GBP", "EURCAD": "EUR/CAD",
-    "XAUUSD": "XAU/USD", "US30": "DJI", "NASDAQ": "IXIC",
-    "BTCUSD": "BTC/USD", "EURUSD": "EUR/USD", "GBPUSD": "GBP/USD", "USDJPY": "USD/JPY"
+PAIRS = ["EURUSD","GBPUSD","USDJPY","XAUUSD","BTCUSD"]
+TIMEFRAMES = {
+    "1M":"1min",
+    "5M":"5min",
+    "15M":"15min",
+    "1H":"1h"
 }
 
-TIMEFRAMES = {"1M": "1min", "5M": "5min", "15M": "15min", "1H": "1h"}
 AUTO_MODE = False
 RISK_MODE = "Medium"
-CHAT_ID = None # Will be set when you send /start
+CHAT_ID = None
 
-# ================= LOGIC =================
-
-def get_session():
-    now = datetime.datetime.utcnow().hour
-    if 8 <= now <= 11: return "London"
-    elif 13 <= now <= 16: return "New York"
-    else: return "Off Session"
-
-def fetch_data(pair, tf):
-    url = f"https://api.twelvedata.com/time_series?symbol={pair}&interval={tf}&apikey={API_KEY}&outputsize=50"
-    r = requests.get(url).json()
-    return r.get("values", [])
-
-def orb_breakout(data):
-    if not data: return None
-    first = data[-1]
-    high, low = float(first["high"]), float(first["low"])
-    last = float(data[0]["close"])
-    if last > high: return "BUY"
-    elif last < low: return "SELL"
+# ================= SESSION =================
+def session():
+    h = datetime.datetime.utcnow().hour
+    if 7 <= h <= 10: return "London"
+    if 13 <= h <= 16: return "New York"
     return None
 
-def liquidity_sweep(data):
-    last = data[0]
-    wick = abs(float(last["high"]) - float(last["low"]))
-    body = abs(float(last["open"]) - float(last["close"]))
+# ================= DATA =================
+def get_data(pair, tf):
+    url = f"https://api.twelvedata.com/time_series?symbol={pair}&interval={tf}&apikey={API_KEY}&outputsize=60"
+    r = requests.get(url).json()
+    return r.get("values",[])
+
+# ================= ORB =================
+def orb_range(data):
+    # first 15 minutes range
+    candles = data[-3:]
+    highs = [float(c["high"]) for c in candles]
+    lows  = [float(c["low"]) for c in candles]
+    return max(highs), min(lows)
+
+def orb_break(data):
+    hi, lo = orb_range(data)
+    last = float(data[0]["close"])
+    if last > hi: return "BUY"
+    if last < lo: return "SELL"
+    return None
+
+# ================= ICT =================
+def liquidity_grab(c):
+    wick = abs(float(c["high"]) - float(c["low"]))
+    body = abs(float(c["open"]) - float(c["close"]))
     return wick > body * 2
 
-def fair_value_gap(data):
-    c1, c2, c3 = data[2], data[1], data[0]
-    return float(c3["low"]) > float(c1["high"]) or float(c3["high"]) < float(c1["low"])
+def fvg(data):
+    a,b,c = data[2],data[1],data[0]
+    return float(c["low"]) > float(a["high"]) or float(c["high"]) < float(a["low"])
 
-def trend_filter(data):
-    closes = [float(c["close"]) for c in data[:20]]
-    ema50 = sum(closes[:10]) / 10
-    ema200 = sum(closes[10:20]) / 10
-    return "BUY" if ema50 > ema200 else "SELL"
+def trend(data):
+    closes=[float(c["close"]) for c in data[:20]]
+    fast=sum(closes[:10])/10
+    slow=sum(closes[10:20])/10
+    return "BUY" if fast>slow else "SELL"
 
-def probability(orb, liq, fvg, trend):
-    score = 0
-    if orb: score += 30
-    if liq: score += 25
-    if fvg: score += 25
-    if trend: score += 20
-    return score
+# ================= SCORE =================
+def score(orb,liq,fvg,tr):
+    s=0
+    if orb: s+=30
+    if liq: s+=25
+    if fvg: s+=25
+    if tr: s+=20
+    return s
 
-def analyze(pair, tf, risk):
-    data = fetch_data(pair, tf)
-    if not data: return None
-    session = get_session()
-    if session == "Off Session": return None
-    orb = orb_breakout(data)
+# ================= MAIN ANALYSIS =================
+def analyze(pair,tf,risk):
+    if not session(): return None
+    
+    d=get_data(pair,tf)
+    if not d: return None
+    
+    orb=orb_break(d)
     if not orb: return None
-    liq = liquidity_sweep(data)
-    fvg = fair_value_gap(data)
-    trend = trend_filter(data)
-    score = probability(orb, liq, fvg, trend)
-    if (risk == "Minimum" and score < 80) or (risk == "Medium" and score < 65) or (risk == "High" and score < 40):
-        return None
-    price = data[0]["close"]
-    return f"PAIR: {pair}\nTF: {tf}\nSESSION: {session}\nTYPE: {orb}\nENTRY: {price}\nWIN RATE: {score}%\nLOGIC: ORB + ICT\nRISK: {risk}"
+    
+    liq=liquidity_grab(d[0])
+    gap=fvg(d)
+    tr=trend(d)
+    
+    s=score(orb,liq,gap,tr)
+    
+    limits={"Minimum":80,"Medium":65,"High":40}
+    if s < limits[risk]: return None
+    
+    return f"""
+🔥 ORB + ICT SIGNAL
+
+PAIR: {pair}
+TF: {tf}
+SESSION: {session()}
+TYPE: {orb}
+ENTRY: {d[0]['close']}
+WIN RATE: {s}%
+RISK: {risk}
+
+LOGIC:
+• ORB Breakout
+• Liquidity Sweep
+• FVG
+• Trend Filter
+"""
 
 # ================= TELEGRAM =================
+MENU=[
+["Signal"],
+["Auto Signal"],
+["Settings"],
+["Help"]
+]
 
-MAIN_MENU = [["Signal"], ["Auto Signal"], ["Settings"], ["Help"]]
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     global CHAT_ID
-    CHAT_ID = update.effective_chat.id
-    await update.message.reply_text("Welcome to ORB + ICT Bot", reply_markup=ReplyKeyboardMarkup(MAIN_MENU, resize_keyboard=True))
+    CHAT_ID=update.effective_chat.id
+    await update.message.reply_text(
+        "Lazy ORB + ICT Bot Ready",
+        reply_markup=ReplyKeyboardMarkup(MENU,resize_keyboard=True)
+    )
 
-async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = update.message.text
-    global AUTO_MODE, RISK_MODE
+async def menu(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
+    global AUTO_MODE,RISK_MODE
+    txt=update.message.text
     
-    if txt == "Signal":
-        await update.message.reply_text("Send pair like: EURUSD 5M")
-    elif txt == "Auto Signal":
-        AUTO_MODE = not AUTO_MODE
-        await update.message.reply_text(f"AUTO MODE: {'ON' if AUTO_MODE else 'OFF'}")
-        if AUTO_MODE: threading.Thread(target=auto_scan, args=(context.bot,)).start()
-    elif txt == "Help":
-        await update.message.reply_text("Manual signal: PAIR TF\nExample: EURUSD 5M")
-    elif txt == "Settings":
-        await update.message.reply_text("Risk modes: Minimum | Medium | High\nType: risk medium")
+    if txt=="Signal":
+        await update.message.reply_text("Send: EURUSD 5M")
+        
+    elif txt=="Auto Signal":
+        AUTO_MODE=not AUTO_MODE
+        await update.message.reply_text(
+            f"AUTO MODE: {'ON' if AUTO_MODE else 'OFF'}"
+        )
+        if AUTO_MODE:
+            asyncio.create_task(auto_scan(ctx))
+            
+    elif txt=="Settings":
+        await update.message.reply_text(
+            "Risk: Minimum | Medium | High\nType: risk medium"
+        )
+        
     elif txt.lower().startswith("risk"):
-        RISK_MODE = txt.split()[1].capitalize()
+        RISK_MODE=txt.split()[1].capitalize()
         await update.message.reply_text(f"Risk set to {RISK_MODE}")
+        
+    elif txt=="Help":
+        await update.message.reply_text(
+            "Manual: PAIR TF\nExample: EURUSD 5M"
+        )
+        
     else:
         try:
-            pair, tf_key = txt.split()
-            tf_val = TIMEFRAMES.get(tf_key.upper())
-            result = analyze(pair.upper(), tf_val, RISK_MODE)
-            await update.message.reply_text(result if result else "No valid setup found.")
-        except Exception:
-            await update.message.reply_text("Invalid format. Use: EURUSD 5M")
+            p,t=txt.split()
+            res=analyze(p.upper(),TIMEFRAMES[t.upper()],RISK_MODE)
+            await update.message.reply_text(res if res else "No setup found")
+        except:
+            await update.message.reply_text("Format: EURUSD 5M")
 
-def auto_scan(bot):
+# ================= AUTO MODE =================
+async def auto_scan(ctx):
+    global AUTO_MODE
     while AUTO_MODE:
         for p in PAIRS:
             for tf in TIMEFRAMES.values():
-                res = analyze(p, tf, RISK_MODE)
-                if res and CHAT_ID:
-                    # Note: You'll need an async way to send from a thread, but for now we'll keep it simple
-                    print(f"Signal found for {p}")
-        time.sleep(60)
+                r=analyze(p,tf,RISK_MODE)
+                if r:
+                    await ctx.bot.send_message(chat_id=CHAT_ID,text=r)
+                    await asyncio.sleep(60)
+        await asyncio.sleep(30)
 
-async def post_init(application: Application):
-    # This kills any old "stuck" connections to Telegram immediately
-    await application.bot.delete_webhook(drop_pending_updates=True)
-
+# ================= MAIN =================
 def main():
-    # 1. Start Web Server for Render
-    threading.Thread(target=run_web_server, daemon=True).start()
-
-    # 2. Build Bot with high timeouts and 'post_init' to clear conflicts
-    app = Application.builder() \
-        .token(BOT_TOKEN) \
-        .connect_timeout(30) \
-        .read_timeout(30) \
-        .post_init(post_init) \
-        .build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT, menu))
-
-    print("Lazy Bot is starting...")
+    import threading
+    threading.Thread(target=run_web,daemon=True).start()
     
-    # 3. 'drop_pending_updates' is the final shield against 409 Conflict
-    app.run_polling(timeout=30, drop_pending_updates=True)
+    app=Application.builder().token(BOT_TOKEN).build()
+    
+    app.add_handler(CommandHandler("start",start))
+    app.add_handler(MessageHandler(filters.TEXT,menu))
+    
+    print("BOT RUNNING...")
+    app.run_polling()
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
-                                              
