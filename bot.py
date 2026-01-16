@@ -1,244 +1,172 @@
-import os, time, threading, datetime, requests
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+import os
+import sqlite3
+import logging
+import asyncio
+import pandas as pd
+from datetime import datetime
+from threading import Thread
+from flask import Flask
+from twelvedata import TDClient
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, ConversationHandler
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+# --- 1. CONFIGURATION & RENDER KEEP-ALIVE ---
 API_KEY = "9935ca70e0f842569acc2790803c1e0c"
+BOT_TOKEN = os.environ.get("BOT_TOKEN")  # Fetches from Render Env Vars
 
-# ====== DATA ======
-PAIRS = ["EURUSD","GBPUSD","EURGBP","AUDGBP","EURCAD",
-         "XAUUSD","US30","NASDAQ","BTCUSD","USDJPY"]
+app_flask = Flask('')
+@app_flask.route('/')
+def home(): return "Bot is running..."
 
-TIMEFRAMES = ["1H","15M","5M","1M"]
-RISK_TYPES = ["Minimum","Low","High"]
+def run_flask():
+    app_flask.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
 
-# ====== STATES ======
-user_state = {}
-history_manual = []
-history_auto = []
-AUTO_MODE = False
+# --- 2. DATABASE LOGIC (HISTORY) ---
+DB_NAME = "trade_history.db"
 
-# ====== KEYBOARDS ======
-MAIN_MENU = [
-    ["Get Signal"],
-    ["Auto Signal"],
-    ["History"],
-    ["Settings"],
-    ["Help"]
-]
+def init_db():
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.execute('''CREATE TABLE IF NOT EXISTS trades 
+                        (id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                         type TEXT, pair TEXT, risk TEXT, outcome TEXT, time TEXT)''')
 
-BACK_MENU = [["Back","Main Menu"]]
+def save_to_history(t_type, pair, risk, outcome):
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.execute("INSERT INTO trades (type, pair, risk, outcome, time) VALUES (?,?,?,?,?)",
+                     (t_type, pair, risk, outcome, datetime.now().strftime("%Y-%m-%d %H:%M")))
 
-def pair_keyboard():
-    rows=[]
-    for i in range(0,len(PAIRS),2):
-        rows.append(PAIRS[i:i+2])
-    rows.append(["Back","Main Menu"])
-    return rows
+# --- 3. TRADING STRATEGY (TWELVE DATA) ---
+td = TDClient(apikey=API_KEY)
 
-def tf_keyboard():
-    return [["1H","15M"],["5M","1M"],["Back","Main Menu"]]
+def analyze_market(symbol, interval, risk_level):
+    try:
+        ts = td.time_series(symbol=symbol, interval=interval, outputsize=100).as_pandas()
+        curr = ts['close'].iloc[-1]
+        support, resistance = ts['low'].min(), ts['high'].max()
 
-def risk_keyboard():
-    return [["Minimum","Low"],["High"],["Back","Main Menu"]]
+        # HIGH RISK: Pure Support/Resistance Retest
+        if risk_level == "High Risk":
+            if curr <= support * 1.002: return f"🔥 BUY {symbol}\nS/R Retest Logic"
+            if curr >= resistance * 0.998: return f"🔥 SELL {symbol}\nS/R Retest Logic"
+            return None
 
-# ====== API LOGIC ======
-
-def fetch(pair,tf):
-    url=f"https://api.twelvedata.com/time_series?symbol={pair}&interval={tf.lower()}&apikey={API_KEY}&outputsize=50"
-    r=requests.get(url).json()
-    return r.get("values",[])
-
-def simple_strategy(data,risk):
-    if not data: return None
-
-    last=float(data[0]["close"])
-    prev=float(data[1]["close"])
-
-    # SUPPORT & RESISTANCE ONLY (as you requested)
-    if risk=="Minimum":
-        cond = abs(last-prev) > 0.002
-    elif risk=="Low":
-        cond = abs(last-prev) > 0.001
-    else:
-        cond = True
-
-    if not cond:
+        # LOW/MIN RISK: EMA + ICT/ORB Confluence
+        ema_200 = ts['close'].ewm(span=200).mean().iloc[-1]
+        orb_high = ts['high'].iloc[:15].max()
+        
+        if risk_level == "Low Risk":
+            if curr <= support * 1.002 and curr > ema_200 and curr > orb_high:
+                return f"🛡️ LOW RISK BUY {symbol}\nFull Confluence Met"
+        elif risk_level == "Minimum Risk":
+            if curr <= support * 1.002 and (curr > ema_200 or curr > orb_high):
+                return f"⚖️ MIN RISK BUY {symbol}\nPartial Confluence Met"
+        
         return None
+    except Exception: return "Error fetching data."
 
-    return "BUY" if last>prev else "SELL"
+# --- 4. TELEGRAM BOT LOGIC ---
+MENU, SELECT_PAIR, SELECT_TF, SELECT_RISK, AUTO_MODE = range(5)
+PAIRS = ["EUR/USD", "GBP/USD", "USD/JPY", "BTC/USD", "ETH/USD", "AUD/USD", "USD/CAD", "NZD/USD", "EUR/JPY", "XAU/USD"]
 
-# ====== CORE ANALYSIS ======
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("🎯 Get Signal", callback_data="get_sig"), InlineKeyboardButton("🤖 Auto Signal", callback_data="auto_sig")],
+        [InlineKeyboardButton("📜 History", callback_data="hist"), InlineKeyboardButton("⚙️ Settings", callback_data="set")],
+        [InlineKeyboardButton("❓ Help", callback_data="help")]
+    ]
+    reply = InlineKeyboardMarkup(keyboard)
+    msg = "📈 **MAIN MENU**\nSelect an option to begin:"
+    if update.callback_query: await update.callback_query.edit_message_text(msg, reply_markup=reply, parse_mode="Markdown")
+    else: await update.message.reply_text(msg, reply_markup=reply, parse_mode="Markdown")
+    return MENU
 
-def analyze(pair,tf,risk):
-    data=fetch(pair,tf)
-    signal=simple_strategy(data,risk)
+# GET SIGNAL FLOW
+async def pair_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    btns = [[InlineKeyboardButton(PAIRS[i], callback_data=f"p_{PAIRS[i]}"), InlineKeyboardButton(PAIRS[i+1], callback_data=f"p_{PAIRS[i+1]}")] for i in range(0, 10, 2)]
+    btns.append([InlineKeyboardButton("⬅️ Back", callback_data="main_menu")])
+    await update.callback_query.edit_message_text("SELECT PAIR:", reply_markup=InlineKeyboardMarkup(btns))
+    return SELECT_PAIR
 
-    if not signal:
-        return None
+async def tf_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['p'] = update.callback_query.data.replace("p_", "")
+    btns = [[InlineKeyboardButton(t, callback_data=f"t_{t}") for t in ["1min", "5min", "15min", "1h"]]]
+    btns.append([InlineKeyboardButton("⬅️ Back", callback_data="get_sig")])
+    await update.callback_query.edit_message_text(f"PAIR: {context.user_data['p']}\nCHOOSE TIMEFRAME:", reply_markup=InlineKeyboardMarkup(btns))
+    return SELECT_TF
 
-    price=data[0]["close"]
-    return f"""
-PAIR: {pair}
-TF: {tf}
-SIGNAL: {signal}
-ENTRY: {price}
-RISK: {risk}
-STATUS: ACTIVE
-""".strip()
+async def risk_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['t'] = update.callback_query.data.replace("t_", "")
+    btns = [[InlineKeyboardButton(r, callback_data=f"r_{r}") for r in ["Low Risk", "Minimum Risk", "High Risk"]]]
+    btns.append([InlineKeyboardButton("⬅️ Back", callback_data=f"p_{context.user_data['p']}")])
+    await update.callback_query.edit_message_text("SELECT RISK:", reply_markup=InlineKeyboardMarkup(btns))
+    return SELECT_RISK
 
-# ====== TELEGRAM FLOW ======
+async def execute_sig(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    risk = update.callback_query.data.replace("r_", "")
+    await update.callback_query.edit_message_text("🔍 Scanning... please wait.")
+    res = analyze_market(context.user_data['p'], context.user_data['t'], risk)
+    
+    msg = res if res else "⚠️ Market not stable for this risk. Try later."
+    save_to_history("Manual", context.user_data['p'], risk, "Signal Sent" if res else "No Signal")
+    
+    btns = [[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]]
+    await update.callback_query.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(btns))
+    return MENU
 
-async def start(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    user_state[update.effective_chat.id]={}
-    await update.message.reply_text(
-        "Welcome to Lazy Trading Bot",
-        reply_markup=ReplyKeyboardMarkup(MAIN_MENU,resize_keyboard=True)
-    )
+# AUTO SIGNAL FLOW
+async def auto_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    btns = [[InlineKeyboardButton(r, callback_data=f"a_{r}") for r in ["Low Risk", "Minimum Risk", "High Risk"]]]
+    btns.append([InlineKeyboardButton("⬅️ Back", callback_data="main_menu")])
+    await update.callback_query.edit_message_text("🤖 AUTO MODE: Select Risk", reply_markup=InlineKeyboardMarkup(btns))
+    return AUTO_MODE
 
-async def handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    chat=update.effective_chat.id
-    text=update.message.text
+async def auto_active(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    risk = update.callback_query.data.replace("a_", "")
+    context.job_queue.run_repeating(auto_task, interval=600, chat_id=update.effective_chat.id, name=str(update.effective_chat.id), data=risk)
+    btns = [[InlineKeyboardButton("🛑 OFF", callback_data="stop_a")]]
+    await update.callback_query.edit_message_text(f"✅ AUTO ACTIVE ({risk})\nStatus: Scanning 10 pairs...", reply_markup=InlineKeyboardMarkup(btns))
+    return AUTO_MODE
 
-    # MAIN MENU
-    if text=="Main Menu":
-        await update.message.reply_text(
-            "Main Menu",
-            reply_markup=ReplyKeyboardMarkup(MAIN_MENU,resize_keyboard=True)
-        )
+async def auto_task(context: ContextTypes.DEFAULT_TYPE):
+    for p in PAIRS:
+        res = analyze_market(p, "1h", context.job.data)
+        if res: 
+            await context.bot.send_message(context.job.chat_id, res)
+            save_to_history("Auto", p, context.job.data, "Signal Sent")
+        await asyncio.sleep(10) # API rate limit protection
 
-    elif text=="Get Signal":
-        user_state[chat]={"stage":"pair"}
-        await update.message.reply_text(
-            "Choose pair",
-            reply_markup=ReplyKeyboardMarkup(pair_keyboard(),resize_keyboard=True)
-        )
+async def auto_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    for j in context.job_queue.get_jobs_by_name(str(update.effective_chat.id)): j.schedule_removal()
+    return await start(update, context)
 
-    elif text in PAIRS:
-        user_state[chat]["pair"]=text
-        user_state[chat]["stage"]="tf"
-        await update.message.reply_text(
-            "Choose timeframe",
-            reply_markup=ReplyKeyboardMarkup(tf_keyboard(),resize_keyboard=True)
-        )
+# HISTORY HANDLER
+async def history_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with sqlite3.connect(DB_NAME) as conn:
+        data = conn.execute("SELECT pair, outcome, time FROM trades ORDER BY id DESC LIMIT 5").fetchall()
+    txt = "📜 **HISTORY (Last 5)**\n\n" + "\n".join([f"• {d[0]} | {d[1]} | {d[2]}" for d in data]) if data else "No history yet."
+    await update.callback_query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="main_menu")]]), parse_mode="Markdown")
+    return MENU
 
-    elif text in TIMEFRAMES:
-        user_state[chat]["tf"]=text
-        user_state[chat]["stage"]="risk"
-        await update.message.reply_text(
-            "Choose risk level",
-            reply_markup=ReplyKeyboardMarkup(risk_keyboard(),resize_keyboard=True)
-        )
-
-    elif text in RISK_TYPES:
-        st=user_state[chat]
-        pair=st["pair"]; tf=st["tf"]; risk=text
-
-        await update.message.reply_text("Scanning market... please wait ⏳")
-
-        res=analyze(pair,tf,risk)
-
-        if res:
-            history_manual.append(res)
-            await update.message.reply_text(res)
-        else:
-            await update.message.reply_text(
-                "Market not stable now.\nBetter setup may appear soon.\nTry later."
-            )
-
-        await update.message.reply_text(
-            "Main Menu",
-            reply_markup=ReplyKeyboardMarkup(MAIN_MENU,resize_keyboard=True)
-        )
-
-    # ===== AUTO MODE =====
-    elif text=="Auto Signal":
-        await update.message.reply_text(
-            "Choose risk for AUTO mode",
-            reply_markup=ReplyKeyboardMarkup(risk_keyboard(),resize_keyboard=True)
-        )
-        user_state[chat]={"stage":"auto_risk"}
-
-    elif user_state.get(chat,{}).get("stage")=="auto_risk" and text in RISK_TYPES:
-        global AUTO_MODE
-        AUTO_MODE=True
-        user_state[chat]["auto_risk"]=text
-
-        await update.message.reply_text(
-            "AUTO MODE ACTIVE\nSignals will be sent automatically.\n\nPress OFF to stop.",
-            reply_markup=ReplyKeyboardMarkup([["OFF"]],resize_keyboard=True)
-        )
-
-        threading.Thread(target=auto_scan,args=(context.bot,chat,text)).start()
-
-    elif text=="OFF":
-        AUTO_MODE=False
-        await update.message.reply_text(
-            "AUTO MODE STOPPED",
-            reply_markup=ReplyKeyboardMarkup(MAIN_MENU,resize_keyboard=True)
-        )
-
-    # ===== HISTORY =====
-    elif text=="History":
-        await update.message.reply_text(
-            "Select history type",
-            reply_markup=ReplyKeyboardMarkup(
-                [["Manual History"],["Auto History"],["Back","Main Menu"]],
-                resize_keyboard=True
-            )
-        )
-
-    elif text=="Manual History":
-        msg="\n\n".join(history_manual[-5:]) or "No history yet"
-        await update.message.reply_text(msg)
-
-    elif text=="Auto History":
-        msg="\n\n".join(history_auto[-5:]) or "No history yet"
-        await update.message.reply_text(msg)
-
-    # ===== SETTINGS =====
-    elif text=="Settings":
-        await update.message.reply_text(
-            "Settings\n\n• Turn notifications ON\n• Do not mute bot\n• Allow background data"
-        )
-
-    # ===== HELP =====
-    elif text=="Help":
-        await update.message.reply_text(
-            "This bot sends trading signals.\n\n"
-            "Use Get Signal for manual trades\n"
-            "Use Auto Signal for automated trades\n\n"
-            "Trade responsibly."
-        )
-
-    elif text=="Back":
-        await update.message.reply_text(
-            "Going back",
-            reply_markup=ReplyKeyboardMarkup(MAIN_MENU,resize_keyboard=True)
-        )
-
-# ===== AUTO SCAN =====
-
-def auto_scan(bot,chat,risk):
-    while AUTO_MODE:
-        for p in PAIRS:
-            for tf in TIMEFRAMES:
-                res=analyze(p,tf,risk)
-                if res:
-                    history_auto.append(res)
-                    bot.send_message(chat_id=chat,text=res)
-        time.sleep(60)
-
-# ===== MAIN =====
-
+# --- 5. MAIN RUNNER ---
 def main():
-    app=Application.builder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start",start))
-    app.add_handler(MessageHandler(filters.TEXT,handler))
-
-    print("BOT RUNNING...")
+    init_db()
+    Thread(target=run_flask).start() # Keep Render Alive
+    
+    app = Application.builder().token(BOT_TOKEN).build()
+    handler = ConversationHandler(
+        entry_points=[CommandHandler("start", start), CallbackQueryHandler(start, pattern="main_menu")],
+        states={
+            MENU: [CallbackQueryHandler(pair_menu, pattern="get_sig"), CallbackQueryHandler(auto_start, pattern="auto_sig"), CallbackQueryHandler(history_view, pattern="hist")],
+            SELECT_PAIR: [CallbackQueryHandler(tf_menu, pattern="p_")],
+            SELECT_TF: [CallbackQueryHandler(risk_menu, pattern="tf_")],
+            SELECT_RISK: [CallbackQueryHandler(execute_sig, pattern="r_")],
+            AUTO_MODE: [CallbackQueryHandler(auto_active, pattern="a_"), CallbackQueryHandler(auto_stop, pattern="stop_a")]
+        },
+        fallbacks=[CommandHandler("start", start)]
+    )
+    app.add_handler(handler)
     app.run_polling()
 
-if __name__=="__main__":
+if __name__ == '__main__':
     main()
+                    
