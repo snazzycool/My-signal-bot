@@ -23,11 +23,20 @@ PAIRS = ["EUR/USD", "GBP/USD", "BTC/USD", "ETH/USD", "XAU/USD", "AUD/USD", "USD/
 TIMEFRAMES = ["1 minute", "5 minutes", "15 minutes", "1 hour"]
 RISKS = ["Low Risk", "Minimum Risk", "High Risk"]
 
-# --- DATABASE (NORTHFLANK PERSISTENT VOLUME) ---
-DB_PATH = "/data/history.db"
+# --- UPDATED DATABASE LOGIC (SAFE PATH) ---
+def get_db_path():
+    # Try the persistent volume first, fallback to local if permission is denied
+    if os.path.exists("/data") or os.access("/", os.W_OK):
+        try:
+            if not os.path.exists("/data"): os.makedirs("/data")
+            return "/data/history.db"
+        except PermissionError:
+            return "history.db"
+    return "history.db"
+
+DB_PATH = get_db_path()
 
 def init_db():
-    if not os.path.exists("/data"): os.makedirs("/data")
     conn = sqlite3.connect(DB_PATH)
     conn.execute("CREATE TABLE IF NOT EXISTS trades (pair TEXT, risk TEXT, outcome TEXT, time TEXT)")
     conn.close()
@@ -62,12 +71,8 @@ def analyze_market(symbol, tf, risk):
 
         # 4. LOW RISK: Liquidity Grab + FVG (The Sniper)
         if risk == "Low Risk":
-            # Liquidity Grab: Check if current low swept the 15-candle swing low
             swing_low = ts['low'].iloc[-16:-1].min()
             grab_success = ts['low'].iloc[-1] < swing_low and curr > swing_low
-            
-            # FVG Detection (Bullish Gap)
-            # Gap between high of candle -3 and low of current candle
             fvg_gap = ts['low'].iloc[-1] > ts['high'].iloc[-3]
             
             if grab_success and fvg_gap and is_bullish:
@@ -75,7 +80,7 @@ def analyze_market(symbol, tf, risk):
 
         return None
     except Exception as e:
-        return f"Scan Error: {str(e)}"
+        return None
 
 # --- INTERFACE HANDLERS ---
 
@@ -134,7 +139,7 @@ async def auto_task(context: ContextTypes.DEFAULT_TYPE):
     for p in PAIRS[:5]:
         res = analyze_market(p, "1h", context.job.data)
         if res: await context.bot.send_message(context.job.chat_id, res)
-        await asyncio.sleep(12) # TwelveData safe rate
+        await asyncio.sleep(12)
 
 async def auto_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for j in context.job_queue.get_jobs_by_name(str(update.effective_chat.id)): j.schedule_removal()
