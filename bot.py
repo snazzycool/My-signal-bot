@@ -144,17 +144,30 @@ def auto_scan(bot):
                     print(f"Signal found for {p}")
         time.sleep(60)
 
+async def post_init(application: Application):
+    # This kills any old "stuck" connections to Telegram immediately
+    await application.bot.delete_webhook(drop_pending_updates=True)
+
 def main():
     # 1. Start Web Server for Render
     threading.Thread(target=run_web_server, daemon=True).start()
 
-    # 2. Build Bot with high timeouts for stability
-    app = Application.builder().token(BOT_TOKEN).connect_timeout(30).read_timeout(30).build()
+    # 2. Build Bot with high timeouts and 'post_init' to clear conflicts
+    app = Application.builder() \
+        .token(BOT_TOKEN) \
+        .connect_timeout(30) \
+        .read_timeout(30) \
+        .post_init(post_init) \
+        .build()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT, menu))
 
     print("Lazy Bot is starting...")
-    app.run_polling(timeout=30)
+    
+    # 3. 'drop_pending_updates' is the final shield against 409 Conflict
+    app.run_polling(timeout=30, drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
+                                              
