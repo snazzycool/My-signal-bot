@@ -15,9 +15,10 @@ def home():
     return "Lazy Bot is Online and Trading!"
 
 def run_web_server():
-    # Render provides a 'PORT' environment variable automatically
-    port = int(os.environ.get('PORT', 8080))
+    # This grabs the port Render assigns (usually 10000)
+    port = int(os.environ.get('PORT', 10000))
     app_web.run(host='0.0.0.0', port=port)
+    
 
 # ================= CONFIG =================
 
