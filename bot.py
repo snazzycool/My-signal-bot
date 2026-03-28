@@ -242,5 +242,5 @@ class TradingBot:
         await self.app.start()
         logger.info("Starting polling...")
         await self.app.updater.start_polling()
-        # Keep the application running
+        # Keep the application running forever
         await asyncio.Event().wait()
