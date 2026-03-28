@@ -227,14 +227,14 @@ class TradingBot:
             states={
                 MAIN_MENU: [
                     MessageHandler(filters.Regex("^(▶️ Start Auto Signals|⛔ Stop Auto Signals|📜 View History|📊 Performance)$"),
-                               self.handle_menu),
+                                   self.handle_menu),
                     MessageHandler(filters.TEXT & ~filters.COMMAND, self.fallback)
                 ]
-             },
-             fallbacks=[CommandHandler("start", self.start)]
-         )
-         self.app.add_handler(conv_handler)
-         self.app.add_handler(CommandHandler("status", self.status_command))
+            },
+            fallbacks=[CommandHandler("start", self.start)]
+        )
+        self.app.add_handler(conv_handler)
+        self.app.add_handler(CommandHandler("status", self.status_command))
 
-         logger.info("Bot started polling...")
-         self.app.run_polling()   # no await, synchronous
+        logger.info("Bot started polling...")
+        self.app.run_polling()
