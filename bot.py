@@ -219,7 +219,6 @@ class TradingBot:
         return MAIN_MENU
 
     async def run_async(self):
-        """Async method that builds the application and starts polling."""
         self.app = Application.builder().token(self.config.BOT_TOKEN).build()
         self.app.add_handler(MessageHandler(filters.ALL, self.register_chat), group=0)
 
@@ -240,7 +239,13 @@ class TradingBot:
         logger.info("Initializing application...")
         await self.app.initialize()
         await self.app.start()
+
+        # Wait a few seconds to let any previous instance finish
+        logger.info("Waiting for previous instance to terminate (if any)...")
+        await asyncio.sleep(5)
+
         logger.info("Starting polling...")
         await self.app.updater.start_polling()
-        # Keep the application running forever
+
+        # Keep the bot running forever
         await asyncio.Event().wait()
