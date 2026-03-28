@@ -241,7 +241,7 @@ class TradingBot:
         await self.app.start()
 
         # Wait a few seconds to let any previous instance finish
-        logger.info("Waiting for previous instance to terminate (if any)...")
+        logger.info("Waiting 5 seconds for previous instance to terminate...")
         await asyncio.sleep(5)
 
         logger.info("Starting polling...")
