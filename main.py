@@ -7,7 +7,6 @@ from database import Database
 from market_data import MarketData
 from strategy import StrategyEngine
 from bot import TradingBot
-from http_server import start_http_server
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,11 +31,7 @@ async def main():
     strategy = StrategyEngine(config, db)
     bot = TradingBot(config, db, market_data, strategy)
 
-    # Run both the HTTP server and the bot in the same event loop
-    await asyncio.gather(
-        start_http_server(),
-        bot.run_async()
-    )
+    await bot.run_async()
 
 if __name__ == "__main__":
     asyncio.run(main())
