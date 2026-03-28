@@ -1,8 +1,9 @@
 import asyncio
 import logging
 import os
-import config                     # import the whole module
-from config import BOT_TOKEN, TWELVE_DATA_API_KEY   # import specific constants
+import threading
+import config
+from config import BOT_TOKEN, TWELVE_DATA_API_KEY
 from database import Database
 from market_data import MarketData
 from strategy import StrategyEngine
@@ -28,15 +29,17 @@ async def main():
     db = Database(dsn)
     await db.init()
 
-    market_data = MarketData(TWELVE_DATA_API_KEY, config)   # pass the module
-    strategy = StrategyEngine(config, db)                   # pass the module
-    bot = TradingBot(config, db, market_data, strategy)     # pass the module
+    market_data = MarketData(TWELVE_DATA_API_KEY, config)
+    strategy = StrategyEngine(config, db)
+    bot = TradingBot(config, db, market_data, strategy)
 
-    # Run HTTP server and bot concurrently
-    await asyncio.gather(
-        start_http_server(),
-        bot.run()
-    )
+    # Start HTTP server in a separate thread
+    http_thread = threading.Thread(target=asyncio.run, args=(start_http_server(),), daemon=True)
+    http_thread.start()
+    logger.info("HTTP server started in background thread")
+
+    # Run the bot (synchronous, will block)
+    bot.run()
 
 if __name__ == "__main__":
     asyncio.run(main())
