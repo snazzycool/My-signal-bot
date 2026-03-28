@@ -2,7 +2,6 @@ python-telegram-bot>=20.0
 twelvedata
 pandas
 python-dotenv
-pandas-ta
 pytz
 asyncpg
 aiohttp
