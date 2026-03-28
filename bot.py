@@ -218,7 +218,7 @@ class TradingBot:
         await update.message.reply_text("Use the menu buttons.")
         return MAIN_MENU
 
-    async def run(self):
+    def run(self):
         self.app = Application.builder().token(self.config.BOT_TOKEN).build()
         self.app.add_handler(MessageHandler(filters.ALL, self.register_chat), group=0)
 
@@ -227,14 +227,14 @@ class TradingBot:
             states={
                 MAIN_MENU: [
                     MessageHandler(filters.Regex("^(▶️ Start Auto Signals|⛔ Stop Auto Signals|📜 View History|📊 Performance)$"),
-                                   self.handle_menu),
+                               self.handle_menu),
                     MessageHandler(filters.TEXT & ~filters.COMMAND, self.fallback)
                 ]
-            },
-            fallbacks=[CommandHandler("start", self.start)]
-        )
-        self.app.add_handler(conv_handler)
-        self.app.add_handler(CommandHandler("status", self.status_command))
+             },
+             fallbacks=[CommandHandler("start", self.start)]
+         )
+         self.app.add_handler(conv_handler)
+         self.app.add_handler(CommandHandler("status", self.status_command))
 
-        logger.info("Bot started polling...")
-        await self.app.run_polling()
+         logger.info("Bot started polling...")
+         self.app.run_polling()   # no await, synchronous
