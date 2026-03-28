@@ -218,7 +218,8 @@ class TradingBot:
         await update.message.reply_text("Use the menu buttons.")
         return MAIN_MENU
 
-    def run(self):
+    async def run_async(self):
+        """Async entry point for the bot (uses same event loop as main)."""
         self.app = Application.builder().token(self.config.BOT_TOKEN).build()
         self.app.add_handler(MessageHandler(filters.ALL, self.register_chat), group=0)
 
@@ -237,4 +238,9 @@ class TradingBot:
         self.app.add_handler(CommandHandler("status", self.status_command))
 
         logger.info("Bot started polling...")
-        self.app.run_polling()
+        await self.app.initialize()
+        await self.app.start()
+        # Start polling (this is the async method)
+        await self.app.updater.start_polling()
+        # Keep running forever
+        await asyncio.Event().wait()
