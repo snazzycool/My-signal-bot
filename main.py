@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import threading
 import config
 from config import BOT_TOKEN, TWELVE_DATA_API_KEY
 from database import Database
@@ -15,7 +16,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-async def main():
+async def run_http():
+    """Run the HTTP server in its own asyncio loop."""
+    await start_http_server()
+
+def start_http_thread():
+    """Start the HTTP server in a background thread."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(run_http())
+    loop.close()
+
+def main():
     if not BOT_TOKEN or not TWELVE_DATA_API_KEY:
         logger.error("Missing BOT_TOKEN or TWELVE_DATA_API_KEY")
         return
@@ -25,18 +37,24 @@ async def main():
         logger.error("DATABASE_URL not set")
         return
 
+    # Initialize database synchronously (asyncio needed)
     db = Database(dsn)
-    await db.init()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(db.init())
+    loop.close()
 
     market_data = MarketData(TWELVE_DATA_API_KEY, config)
     strategy = StrategyEngine(config, db)
     bot = TradingBot(config, db, market_data, strategy)
 
-    # Run both the HTTP server and the bot in the same event loop
-    await asyncio.gather(
-        start_http_server(),
-        bot.run_async()
-    )
+    # Start HTTP server in a background thread
+    http_thread = threading.Thread(target=start_http_thread, daemon=True)
+    http_thread.start()
+    logger.info("HTTP server started in background thread")
+
+    # Run the bot (synchronous, blocks main thread)
+    bot.run_sync()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
