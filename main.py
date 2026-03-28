@@ -33,7 +33,7 @@ async def main():
     strategy = StrategyEngine(config, db)
     bot = TradingBot(config, db, market_data, strategy)
 
-    # Start HTTP server in a separate thread
+    # Start HTTP server in a background thread
     http_thread = threading.Thread(target=asyncio.run, args=(start_http_server(),), daemon=True)
     http_thread.start()
     logger.info("HTTP server started in background thread")
