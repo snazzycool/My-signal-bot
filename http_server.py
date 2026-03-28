@@ -7,7 +7,7 @@ async def health_check(request):
     return web.Response(text="OK")
 
 async def start_http_server():
-    port = int(os.getenv("PORT", 8000))
+    port = int(os.getenv("PORT", 10000))
     app = web.Application()
     app.router.add_get('/health', health_check)
     runner = web.AppRunner(app)
