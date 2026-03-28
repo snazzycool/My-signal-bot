@@ -1,5 +1,4 @@
 import pandas as pd
-import pandas_ta as ta
 import numpy as np
 import logging
 from datetime import datetime
@@ -12,7 +11,25 @@ class StrategyEngine:
         self.config = config
         self.db = db
 
-    # ---------- Indicator Computation ----------
+    # ---------- Manual Indicators ----------
+    def compute_rsi(self, close: pd.Series, period: int = 14) -> pd.Series:
+        delta = close.diff()
+        gain = delta.where(delta > 0, 0.0)
+        loss = -delta.where(delta < 0, 0.0)
+        avg_gain = gain.rolling(window=period).mean()
+        avg_loss = loss.rolling(window=period).mean()
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi
+
+    def compute_atr(self, high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+        tr1 = high - low
+        tr2 = abs(high - close.shift(1))
+        tr3 = abs(low - close.shift(1))
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr = tr.rolling(window=period).mean()
+        return atr
+
     def compute_indicators(self, df: pd.DataFrame) -> dict:
         if df is None or len(df) < 100:
             return None
@@ -23,8 +40,8 @@ class StrategyEngine:
 
         ema_fast = close.ewm(span=self.config.EMA_FAST, adjust=False).mean()
         ema_slow = close.ewm(span=self.config.EMA_SLOW, adjust=False).mean()
-        rsi = ta.rsi(close, length=self.config.RSI_PERIOD)
-        atr = ta.atr(high, low, close, length=self.config.ATR_PERIOD)
+        rsi = self.compute_rsi(close, self.config.RSI_PERIOD)
+        atr = self.compute_atr(high, low, close, self.config.ATR_PERIOD)
         atr_avg = atr.rolling(20).mean()
         swing_high = high.rolling(window=5, center=True).max()
         swing_low = low.rolling(window=5, center=True).min()
@@ -414,4 +431,4 @@ class StrategyEngine:
             'details': details,
             'liquidity_sweep': liquidity_sweep,
             'structure': structure
-  }
+    }
