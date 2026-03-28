@@ -431,4 +431,4 @@ class StrategyEngine:
             'details': details,
             'liquidity_sweep': liquidity_sweep,
             'structure': structure
-    }
+            }
