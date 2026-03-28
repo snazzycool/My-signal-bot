@@ -36,7 +36,7 @@ class Database:
                     last_time REAL
                 )
             ''')
-            # Chats table – drop and recreate to ensure BIGINT type
+            # Chats table – ensure BIGINT
             await conn.execute('DROP TABLE IF EXISTS chats')
             await conn.execute('''
                 CREATE TABLE chats (
