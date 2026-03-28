@@ -218,8 +218,8 @@ class TradingBot:
         await update.message.reply_text("Use the menu buttons.")
         return MAIN_MENU
 
-    def run_sync(self):
-        """Synchronous entry point (calls run_polling)."""
+    async def run_async(self):
+        """Async method that builds the application and starts polling."""
         self.app = Application.builder().token(self.config.BOT_TOKEN).build()
         self.app.add_handler(MessageHandler(filters.ALL, self.register_chat), group=0)
 
@@ -237,6 +237,10 @@ class TradingBot:
         self.app.add_handler(conv_handler)
         self.app.add_handler(CommandHandler("status", self.status_command))
 
-        logger.info("Bot started polling...")
-        # This is synchronous and blocks until the bot stops
-        self.app.run_polling()
+        logger.info("Initializing application...")
+        await self.app.initialize()
+        await self.app.start()
+        logger.info("Starting polling...")
+        await self.app.updater.start_polling()
+        # Keep the application running
+        await asyncio.Event().wait()
