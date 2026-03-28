@@ -1,206 +1,240 @@
-import os
-import sqlite3
 import asyncio
-import pandas as pd
+import logging
 from datetime import datetime
-from twelvedata import TDClient
-from telegram import ReplyKeyboardMarkup, Update
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler, 
-    filters, ContextTypes, ConversationHandler
-)
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
+from config import *
+from database import Database
+from market_data import MarketData
+from strategy import StrategyEngine
+from utils import format_signal_message
 
-# --- CONFIGURATION ---
-API_KEY = "9935ca70e0f842569acc2790803c1e0c"
-BOT_TOKEN = os.environ.get("BOT_TOKEN") 
-td = TDClient(apikey=API_KEY)
+logger = logging.getLogger(__name__)
 
-# States & Lists
-MENU, SELECT_PAIR, SELECT_TF, SELECT_RISK, AUTO_RISK, AUTO_ACTIVE = range(6)
-PAIRS = ["EUR/USD", "GBP/USD", "BTC/USD", "ETH/USD", "XAU/USD", "AUD/USD", "USD/JPY", "USD/CAD", "GBP/JPY", "BNB/USD"]
-TIMEFRAMES = ["1 minute", "5 minutes", "15 minutes", "1 hour"]
-RISKS = ["Low Risk", "Minimum Risk", "High Risk"]
+MAIN_MENU = 0
 
-# --- DATABASE LOGIC (STRICT SAFE PATH) ---
-def get_db_path():
-    # If /data exists (Volume mounted), use it. Otherwise use local folder.
-    if os.path.exists("/data"):
-        return "/data/history.db"
-    return "history.db"
+class TradingBot:
+    def __init__(self, config, db: Database, market_data: MarketData, strategy: StrategyEngine):
+        self.config = config
+        self.db = db
+        self.market_data = market_data
+        self.strategy = strategy
+        self.app = None
+        self.scanning_running = False
+        self.start_time = datetime.utcnow()
+        self.last_scan_time = None
 
-DB_PATH = get_db_path()
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        keyboard = [
+            [KeyboardButton("▶️ Start Auto Signals")],
+            [KeyboardButton("⛔ Stop Auto Signals")],
+            [KeyboardButton("📜 View History")],
+            [KeyboardButton("📊 Performance")]
+        ]
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        await update.message.reply_text(
+            "🤖 **Trading Bot**\n\nChoose an option:",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+        return MAIN_MENU
 
-def init_db():
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        conn.execute('''CREATE TABLE IF NOT EXISTS trades 
-                        (pair TEXT, risk TEXT, entry REAL, sl REAL, tp REAL, outcome TEXT, time TEXT)''')
-        conn.close()
-        print(f"Database initialized at: {DB_PATH}")
-    except Exception as e:
-        print(f"Database Error: {e}")
+    async def handle_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        text = update.message.text
+        if text == "▶️ Start Auto Signals":
+            return await self.start_auto(update, context)
+        elif text == "⛔ Stop Auto Signals":
+            return await self.stop_auto(update, context)
+        elif text == "📜 View History":
+            return await self.view_history(update, context)
+        elif text == "📊 Performance":
+            return await self.view_performance(update, context)
+        else:
+            await update.message.reply_text("Unknown option. Use the menu buttons.")
+            return MAIN_MENU
 
-def log_trade(pair, risk, entry, sl, tp, outcome):
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?)", 
-                     (pair, risk, entry, sl, tp, outcome, datetime.now().strftime("%Y-%m-%d %H:%M")))
+    async def start_auto(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if self.scanning_running:
+            await update.message.reply_text("Auto signals already running.")
+            return MAIN_MENU
 
-# --- STRATEGY ENGINE ---
-def analyze_market(symbol, tf, risk_level):
-    try:
-        api_tf = "1min" if "1" in tf else "5min" if "5" in tf else "15min" if "15" in tf else "1h"
-        ts = td.time_series(symbol=symbol, interval=api_tf, outputsize=100).as_pandas()
-        curr = ts['close'].iloc[-1]
-        
-        recent_low = ts['low'].iloc[-25:].min()
-        recent_high = ts['high'].iloc[-25:].max()
-        
-        sl = recent_low - (curr * 0.0003)
-        tp = recent_high * 0.9998
-        
-        risk_val = abs(curr - sl)
-        reward_val = abs(tp - curr)
-        rr = reward_val / risk_val if risk_val > 0 else 0
-        ema_200 = ts['close'].ewm(span=200).mean().iloc[-1]
-        is_bullish = curr > ema_200
+        self.scanning_running = True
+        context.job_queue.run_repeating(
+            self.scan_markets,
+            interval=300,
+            first=10,
+            name="scan_job"
+        )
+        context.job_queue.run_repeating(
+            self.verify_trades,
+            interval=1800,
+            first=30,
+            name="verify_job"
+        )
+        await update.message.reply_text("✅ Auto signals started. Scanning every 5 minutes.")
+        return MAIN_MENU
 
-        if risk_level == "Low Risk":
-            grab = ts['low'].iloc[-1] < ts['low'].iloc[-15:-1].min() and curr > ts['low'].iloc[-15:-1].min()
-            fvg = ts['low'].iloc[-1] > ts['high'].iloc[-3]
-            if grab and fvg and is_bullish and rr >= 1.2:
-                return f"🛡️ **BUY NOW (Low Risk)**\nEntry: {curr}\nSL: {sl:.5f}\nTP: {tp:.5f}\nRR: 1:{rr:.1f}", curr, sl, tp
+    async def stop_auto(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        self.scanning_running = False
+        for job in context.job_queue.jobs():
+            if job.name in ["scan_job", "verify_job"]:
+                job.schedule_removal()
+        await update.message.reply_text("⛔ Auto signals stopped.")
+        return MAIN_MENU
 
-        elif risk_level == "Minimum Risk":
-            if curr <= recent_low * 1.002 and is_bullish and rr >= 1.2:
-                return f"⚖️ **BUY NOW (Min Risk)**\nEntry: {curr}\nSL: {sl:.5f}\nTP: {tp:.5f}\nRR: 1:{rr:.1f}", curr, sl, tp
+    async def scan_markets(self, context: ContextTypes.DEFAULT_TYPE):
+        if not self.scanning_running:
+            return
+        self.last_scan_time = datetime.utcnow()
 
-        elif risk_level == "High Risk":
-            if curr <= recent_low * 1.002 and rr >= 1.5:
-                return f"🔥 **BUY NOW (High Risk)**\nEntry: {curr}\nSL: {sl:.5f}\nTP: {tp:.5f}\nRR: 1:{rr:.1f}", curr, sl, tp
-        
-        return None, None, None, None
-    except: return None, None, None, None
+        tasks = [self.market_data.fetch_multitimeframe(pair) for pair in self.config.PAIRS]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-# --- BACKGROUND TASKS ---
-async def verify_trades(context: ContextTypes.DEFAULT_TYPE):
-    with sqlite3.connect(DB_PATH) as conn:
-        pending = conn.execute("SELECT rowid, pair, sl, tp FROM trades WHERE outcome = 'Pending'").fetchall()
-    for rowid, pair, sl, tp in pending:
-        try:
-            price = td.time_series(symbol=pair, interval="1min", outputsize=1).as_pandas()['close'].iloc[-1]
-            outcome = None
-            if price >= tp: outcome = "✅ WIN"
-            elif price <= sl: outcome = "❌ LOSS"
-            if outcome:
-                with sqlite3.connect(DB_PATH) as conn:
-                    conn.execute("UPDATE trades SET outcome = ? WHERE rowid = ?", (outcome, rowid))
-        except: continue
+        for pair, data in zip(self.config.PAIRS, results):
+            if isinstance(data, Exception) or data["htf"] is None or data["entry"] is None:
+                logger.warning(f"Skipping {pair} due to data error")
+                continue
 
-async def auto_task(context: ContextTypes.DEFAULT_TYPE):
-    for p in PAIRS[:5]:
-        msg, entry, sl, tp = analyze_market(p, "1h", context.job.data)
-        if msg:
-            log_trade(p, context.job.data, entry, sl, tp, "Pending")
-            await context.bot.send_message(context.job.chat_id, msg, parse_mode="Markdown")
-        await asyncio.sleep(15)
+            signal = await self.strategy.generate_signal(pair, data["htf"], data["entry"])
+            if signal:
+                trade_id = await self.db.log_trade(
+                    pair, signal['direction'], signal['entry'],
+                    signal['sl'], signal['tp'], signal['partial_tp'],
+                    signal['score']
+                )
+                if trade_id > 0:
+                    active_chats = await self._get_active_chats()
+                    for chat_id in active_chats:
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=format_signal_message(signal, pair),
+                            parse_mode='Markdown'
+                        )
+                    logger.info(f"Signal sent for {pair} (score={signal['score']})")
+                else:
+                    logger.error(f"Failed to log trade for {pair}")
 
-# --- INTERFACE HANDLERS ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [["🎯 Get Signal", "🤖 Auto Signal"], ["📜 History", "⚙️ Settings"], ["❓ Help"]]
-    await update.message.reply_text("MAIN MENU", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
-    return MENU
+    async def verify_trades(self, context: ContextTypes.DEFAULT_TYPE):
+        trades = await self.db.get_pending_trades()
+        for trade in trades:
+            try:
+                price_data = await self.market_data.fetch_ohlcv(trade['pair'], "1min", outputsize=1)
+                if price_data is None or price_data.empty:
+                    continue
+                current_price = price_data['close'].iloc[-1]
 
-async def gs_pair(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [PAIRS[i:i+2] for i in range(0, 10, 2)] + [["🏠 Main Menu"]]
-    await update.message.reply_text("Select Pair:", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
-    return SELECT_PAIR
+                if not trade['partial_notified'] and trade['partial_tp'] is not None:
+                    if (trade['direction'] == 'BUY' and current_price >= trade['partial_tp']) or \
+                       (trade['direction'] == 'SELL' and current_price <= trade['partial_tp']):
+                        await self.db.mark_partial_notified(trade['id'])
+                        active_chats = await self._get_active_chats()
+                        for chat_id in active_chats:
+                            await context.bot.send_message(
+                                chat_id=chat_id,
+                                text=f"🎯 **Partial TP hit** for {trade['pair']} ({trade['direction']}) at {trade['partial_tp']:.5f}\n1:1 RR achieved.",
+                                parse_mode='Markdown'
+                            )
+                        logger.info(f"Partial TP notified for trade {trade['id']}")
 
-async def gs_tf(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.text == "🏠 Main Menu": return await start(update, context)
-    context.user_data['p'] = update.message.text
-    kb = [TIMEFRAMES[0:2], TIMEFRAMES[2:4], ["🏠 Main Menu"]]
-    await update.message.reply_text("Select Timeframe:", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
-    return SELECT_TF
+                if trade['direction'] == 'BUY':
+                    if current_price >= trade['tp']:
+                        outcome = 'WIN'
+                    elif current_price <= trade['sl']:
+                        outcome = 'LOSS'
+                    else:
+                        continue
+                else:
+                    if current_price <= trade['tp']:
+                        outcome = 'WIN'
+                    elif current_price >= trade['sl']:
+                        outcome = 'LOSS'
+                    else:
+                        continue
 
-async def gs_risk(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.text == "🏠 Main Menu": return await start(update, context)
-    context.user_data['t'] = update.message.text
-    kb = [RISKS, ["🏠 Main Menu"]]
-    await update.message.reply_text("Select Risk:", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
-    return SELECT_RISK
+                await self.db.update_trade_outcome(trade['id'], outcome)
+                active_chats = await self._get_active_chats()
+                for chat_id in active_chats:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"📢 Trade {outcome} for {trade['pair']} ({trade['direction']})",
+                        parse_mode='Markdown'
+                    )
+                logger.info(f"Trade {trade['id']} marked as {outcome}")
+            except Exception as e:
+                logger.error(f"Error verifying trade {trade['id']}: {e}")
 
-async def gs_final(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.text == "🏠 Main Menu": return await start(update, context)
-    risk, pair, tf = update.message.text, context.user_data['p'], context.user_data['t']
-    await update.message.reply_text(f"🔍 Scanning {pair}...")
-    msg, entry, sl, tp = analyze_market(pair, tf, risk)
-    if msg:
-        log_trade(pair, risk, entry, sl, tp, "Pending")
-        await update.message.reply_text(msg, parse_mode="Markdown")
-    else:
-        await update.message.reply_text("⚠️ No setup found for immediate entry.")
-    return await start(update, context)
+    async def view_history(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        trades = await self.db.get_recent_trades(limit=10)
+        if not trades:
+            await update.message.reply_text("No trades yet.")
+        else:
+            lines = []
+            for t in trades:
+                lines.append(
+                    f"{t['timestamp'][:16]} | {t['pair']} | {t['direction']} | {t['status']} | Score:{t['score']}"
+                )
+            msg = "📜 **Recent Trades**\n\n" + "\n".join(lines)
+            await update.message.reply_text(msg, parse_mode='Markdown')
+        return MAIN_MENU
 
-async def auto_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [RISKS, ["🏠 Main Menu"]]
-    await update.message.reply_text("AUTO MODE: Select Risk", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
-    return AUTO_RISK
+    async def view_performance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        total, wins, losses, win_rate = await self.db.get_performance()
+        pair_perf = await self.db.get_pair_performance()
+        msg = f"📊 **Performance**\nTotal Trades: {total}\nWins: {wins}\nLosses: {losses}\nWin Rate: {win_rate:.1f}%\n\n**Per Pair:**\n"
+        if pair_perf:
+            for pair, (w, l) in pair_perf.items():
+                total_pair = w + l
+                rate = (w / total_pair * 100) if total_pair > 0 else 0
+                msg += f"{pair}: {w}/{l} ({rate:.1f}%)\n"
+        else:
+            msg += "No completed trades yet."
+        await update.message.reply_text(msg, parse_mode='Markdown')
+        return MAIN_MENU
 
-async def auto_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.text == "🏠 Main Menu": return await start(update, context)
-    risk = update.message.text
-    await update.message.reply_text(f"🤖 AUTO SIGNAL ACTIVE ({risk})", reply_markup=ReplyKeyboardMarkup([["🛑 STOP AUTO SIGNAL"]], resize_keyboard=True))
-    context.job_queue.run_repeating(auto_task, interval=600, chat_id=update.effective_chat.id, name=str(update.effective_chat.id), data=risk)
-    return AUTO_ACTIVE
+    async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        uptime = datetime.utcnow() - self.start_time
+        active_chats = len(await self._get_active_chats())
+        last_scan = self.last_scan_time.isoformat() if self.last_scan_time else "Never"
+        kill_zone_active = "Yes" if self.strategy._is_kill_zone() else "No"
+        msg = (
+            f"🤖 **Bot Status**\n"
+            f"Uptime: {str(uptime).split('.')[0]}\n"
+            f"Active chats: {active_chats}\n"
+            f"Auto scanning: {'ON' if self.scanning_running else 'OFF'}\n"
+            f"Last scan: {last_scan}\n"
+            f"Kill zone active: {kill_zone_active}\n"
+            f"Session filter: {'ON' if self.config.ENABLE_SESSION_FILTER else 'OFF'}"
+        )
+        await update.message.reply_text(msg, parse_mode='Markdown')
 
-async def auto_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    for j in context.job_queue.get_jobs_by_name(str(update.effective_chat.id)): j.schedule_removal()
-    await update.message.reply_text("Auto Signal Stopped.")
-    return await start(update, context)
+    async def _get_active_chats(self) -> list:
+        return await self.db.get_all_chats()
 
-async def show_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    with sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute("SELECT pair, outcome, time FROM trades ORDER BY time DESC LIMIT 5").fetchall()
-    txt = "📜 **HISTORY**\n\n" + "\n".join([f"• {r[0]} | {r[1]} ({r[2]})" for r in rows]) if rows else "Empty."
-    await update.message.reply_text(txt, parse_mode="Markdown")
-    return MENU
+    async def register_chat(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.effective_chat.id
+        await self.db.add_chat(chat_id)
 
-async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("❓ **HELP**\nLow Risk: ICT Sweeps + FVG\nAll signals show Entry, SL, and TP.", parse_mode="Markdown")
-    return MENU
+    async def fallback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text("Use the menu buttons.")
+        return MAIN_MENU
 
-# --- MAIN RUNNER ---
-def main():
-    print("--- SERVER STARTING ---")
-    init_db()
-    if not BOT_TOKEN:
-        print("ERROR: BOT_TOKEN not found in environment variables!")
-        return
+    async def run(self):
+        self.app = Application.builder().token(self.config.BOT_TOKEN).build()
+        self.app.add_handler(MessageHandler(filters.ALL, self.register_chat), group=0)
 
-    app = Application.builder().token(BOT_TOKEN).build()
-    
-    # Verify job runs every 30 mins
-    app.job_queue.run_repeating(verify_trades, interval=1800, first=10)
-    
-    conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            MENU: [MessageHandler(filters.Regex("^🎯 Get Signal$"), gs_pair),
-                   MessageHandler(filters.Regex("^🤖 Auto Signal$"), auto_start),
-                   MessageHandler(filters.Regex("^📜 History$"), show_history),
-                   MessageHandler(filters.Regex("^❓ Help$"), show_help)],
-            SELECT_PAIR: [MessageHandler(filters.TEXT & ~filters.COMMAND, gs_tf)],
-            SELECT_TF: [MessageHandler(filters.TEXT & ~filters.COMMAND, gs_risk)],
-            SELECT_RISK: [MessageHandler(filters.TEXT & ~filters.COMMAND, gs_final)],
-            AUTO_RISK: [MessageHandler(filters.TEXT & ~filters.COMMAND, auto_run)],
-            AUTO_ACTIVE: [MessageHandler(filters.Regex("^🛑 STOP AUTO SIGNAL$"), auto_stop)]
-        },
-        fallbacks=[CommandHandler("start", start)]
-    )
-    
-    app.add_handler(conv)
-    print("SUCCESS: Bot is now polling for messages...")
-    app.run_polling()
+        conv_handler = ConversationHandler(
+            entry_points=[CommandHandler("start", self.start)],
+            states={
+                MAIN_MENU: [
+                    MessageHandler(filters.Regex("^(▶️ Start Auto Signals|⛔ Stop Auto Signals|📜 View History|📊 Performance)$"),
+                                   self.handle_menu),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.fallback)
+                ]
+            },
+            fallbacks=[CommandHandler("start", self.start)]
+        )
+        self.app.add_handler(conv_handler)
+        self.app.add_handler(CommandHandler("status", self.status_command))
 
-if __name__ == "__main__":
-    main()
+        logger.info("Bot started polling...")
+        await self.app.run_polling()
