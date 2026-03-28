@@ -1,4 +1,8 @@
-python-telegram-bot[job_queue]
+python-telegram-bot>=20.0
 twelvedata
 pandas
-flask
+python-dotenv
+pandas-ta
+pytz
+asyncpg
+aiohttp
