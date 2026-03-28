@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import os
-import threading
 import config
 from config import BOT_TOKEN, TWELVE_DATA_API_KEY
 from database import Database
@@ -33,13 +32,11 @@ async def main():
     strategy = StrategyEngine(config, db)
     bot = TradingBot(config, db, market_data, strategy)
 
-    # Start HTTP server in a background thread
-    http_thread = threading.Thread(target=asyncio.run, args=(start_http_server(),), daemon=True)
-    http_thread.start()
-    logger.info("HTTP server started in background thread")
-
-    # Run the bot (synchronous, will block)
-    bot.run()
+    # Run both the HTTP server and the bot in the same event loop
+    await asyncio.gather(
+        start_http_server(),
+        bot.run_async()
+    )
 
 if __name__ == "__main__":
     asyncio.run(main())
