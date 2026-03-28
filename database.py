@@ -13,6 +13,7 @@ class Database:
     async def init(self):
         self.pool = await asyncpg.create_pool(self.dsn, min_size=1, max_size=5)
         async with self.pool.acquire() as conn:
+            # Trades table
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS trades (
                     id SERIAL PRIMARY KEY,
@@ -28,17 +29,21 @@ class Database:
                     status TEXT DEFAULT 'PENDING'
                 )
             ''')
+            # Last signal times
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS last_signal (
                     pair TEXT PRIMARY KEY,
                     last_time REAL
                 )
             ''')
+            # Chats table – drop and recreate to ensure BIGINT type
+            await conn.execute('DROP TABLE IF EXISTS chats')
             await conn.execute('''
-                CREATE TABLE IF NOT EXISTS chats (
-                    chat_id INTEGER PRIMARY KEY
+                CREATE TABLE chats (
+                    chat_id BIGINT PRIMARY KEY
                 )
             ''')
+            # Index
             await conn.execute('CREATE INDEX IF NOT EXISTS idx_status ON trades(status)')
         logger.info("PostgreSQL database initialized")
 
